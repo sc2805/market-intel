@@ -2,11 +2,7 @@
   "crons": [
     {
       "path": "/api/news",
-      "schedule": "0 2,8,14 * * *"
+      "schedule": "0 2 * * *"
     }
-  ],
-  "rewrites": [
-    { "source": "/api/(.*)", "destination": "/api/$1" },
-    { "source": "/(.*)", "destination": "/index.html" }
   ]
 }
