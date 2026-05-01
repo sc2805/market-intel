@@ -1,14 +1,14 @@
 import { useState } from 'react';
-import { newsData, getImpactMagnitude, getStoriesByImpact } from '../data/newsData';
+import { getImpactMagnitude, getStoriesByImpact } from '../data/newsData';
 
 function getMarketTags(impacts) {
   const tags = [];
+  if (!impacts?.markets) return tags;
   Object.entries(impacts.markets).forEach(([key, score]) => {
     if (score !== 0) {
       tags.push({ name: key.replace(/_/g, ' '), score, type: score > 0 ? 'positive' : 'negative' });
     }
   });
-  // Sort by absolute value so most impacted markets show first
   return tags.sort((a, b) => Math.abs(b.score) - Math.abs(a.score));
 }
 
@@ -23,8 +23,12 @@ function getMagnitudeColor(magnitude) {
   return '#5cd97a';
 }
 
-export default function ShockFeed({ onStoryClick }) {
-  const sorted = getStoriesByImpact(newsData);
+export default function ShockFeed({ newsData: stories, onStoryClick }) {
+  if (!stories || stories.length === 0) {
+    return <div style={{ color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', padding: 40, textAlign: 'center' }}>No data available</div>;
+  }
+
+  const sorted = getStoriesByImpact(stories);
   const maxMagnitude = getImpactMagnitude(sorted[0]);
   const [expandedId, setExpandedId] = useState(null);
 

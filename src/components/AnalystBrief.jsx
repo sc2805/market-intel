@@ -1,12 +1,19 @@
-import { newsData, getTopStories, getNetSentiment, getImpactMagnitude } from '../data/newsData';
+import { getTopStories, getNetSentiment, getImpactMagnitude } from '../data/newsData';
 
-export default function AnalystBrief() {
-  const topStories = getTopStories(newsData, 3);
-  const sentiment = getNetSentiment(newsData);
-  const totalMagnitude = newsData.reduce((sum, s) => sum + getImpactMagnitude(s), 0);
+export default function AnalystBrief({ newsData: stories }) {
+  if (!stories || stories.length === 0) {
+    return <div style={{ color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', padding: 40, textAlign: 'center' }}>No data available</div>;
+  }
 
-  const sentimentClass = sentiment.label === 'RISK-OFF' ? 'risk-off' : 
+  const topStories = getTopStories(stories, 3);
+  const sentiment = getNetSentiment(stories);
+  const totalMagnitude = stories.reduce((sum, s) => sum + getImpactMagnitude(s), 0);
+
+  const sentimentClass = sentiment.label === 'RISK-OFF' ? 'risk-off' :
                          sentiment.label === 'RISK-ON' ? 'risk-on' : 'neutral';
+
+  const today = new Date();
+  const dateStr = today.toLocaleDateString('en-IN', { month: 'long', day: 'numeric', year: 'numeric' });
 
   return (
     <div className="analyst-brief">
@@ -14,7 +21,7 @@ export default function AnalystBrief() {
         <div className="brief-eyebrow">Global Markets Intelligence Desk</div>
         <div className="brief-title">3 Things That Matter Before<br />Your Morning Meeting</div>
         <div className="brief-date">
-          May 1, 2026 — Pre-Market Brief | {newsData.length} Stories Analyzed
+          {dateStr} — Pre-Market Brief | {stories.length} Stories Analyzed
         </div>
       </div>
 
@@ -25,10 +32,10 @@ export default function AnalystBrief() {
           <div className="brief-story-source">
             {story.source} • {story.type} • Impact Magnitude: {getImpactMagnitude(story)}
           </div>
-          
+
           <div className="brief-section-label">Analysis</div>
           <div className="brief-analysis">{story.analysis}</div>
-          
+
           <div className="brief-section-label">Action Items</div>
           <ul className="brief-actions">
             {story.analyst_brief.split(/\d+\)\s*/).filter(Boolean).map((item, i) => (
@@ -42,8 +49,7 @@ export default function AnalystBrief() {
         <div>
           <div className="brief-footer-label">Net Market Sentiment</div>
           <div className={`brief-footer-value ${sentimentClass}`}>
-            {sentiment.label === 'RISK-OFF' ? '◉ ' : sentiment.label === 'RISK-ON' ? '◉ ' : '◎ '}
-            {sentiment.label}
+            ◉ {sentiment.label}
           </div>
         </div>
 
@@ -63,7 +69,7 @@ export default function AnalystBrief() {
         </div>
 
         <div className="brief-footer-stat">
-          <div className="brief-footer-stat-value">{newsData.length}</div>
+          <div className="brief-footer-stat-value">{stories.length}</div>
           <div className="brief-footer-stat-label">Stories Tracked</div>
         </div>
       </div>

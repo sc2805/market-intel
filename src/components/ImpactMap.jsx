@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { newsData, computeAggregateImpacts, getImpactMagnitude } from '../data/newsData';
+import { computeAggregateImpacts, getImpactMagnitude } from '../data/newsData';
 
 function getScoreClass(score) {
   if (score <= -5) return 'cell-severe-negative';
@@ -37,17 +37,21 @@ function HeatmapGrid({ data, className }) {
   );
 }
 
-export default function ImpactMap({ onStorySelect }) {
+export default function ImpactMap({ newsData: stories }) {
   const [selectedStory, setSelectedStory] = useState(null);
   const [showAggregate, setShowAggregate] = useState(true);
 
-  const sortedStories = [...newsData].sort((a, b) => getImpactMagnitude(b) - getImpactMagnitude(a));
+  if (!stories || stories.length === 0) {
+    return <div style={{ color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', padding: 40, textAlign: 'center' }}>No data available</div>;
+  }
+
+  const sortedStories = [...stories].sort((a, b) => getImpactMagnitude(b) - getImpactMagnitude(a));
 
   const currentImpacts = showAggregate
-    ? computeAggregateImpacts(newsData)
+    ? computeAggregateImpacts(stories)
     : selectedStory
     ? selectedStory.impacts
-    : computeAggregateImpacts(newsData);
+    : computeAggregateImpacts(stories);
 
   const handleStoryClick = (story) => {
     setShowAggregate(false);
