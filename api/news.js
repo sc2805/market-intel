@@ -138,15 +138,24 @@ async function analyzeWithGemini(headlines) {
 
   const headlineList = headlines.map((h, i) => `${i + 1}. "${h.headline}" — ${h.source}`).join('\n');
 
-  const prompt = `You are a Global Markets Intelligence Analyst. Analyze these headlines and return a JSON array.
+  const prompt = `You are a Global Markets Intelligence Analyst at Goldman Sachs. Analyze these ${headlines.length} news headlines. Return a JSON array with one object per headline.
 
 HEADLINES:
 ${headlineList}
 
-For each, return:
-{"id":number,"headline":"text","source":"name","type":"Monetary Policy|Geopolitical|Earnings|Regulatory|Commodity Shock|Trade Policy|Currency|Tech Disruption","timestamp":"ISO date","impacts":{"markets":{"US":score,"India":score,"China":score,"EU":score,"Japan":score,"UK":score,"EM":score,"Middle_East":score},"sectors":{"Banking":score,"Technology":score,"Pharma":score,"Energy":score,"Metals":score,"Real_Estate":score,"FMCG":score,"Auto":score,"Telecom":score,"Infrastructure":score},"assets":{"Equities":score,"Bonds":score,"Gold":score,"Crude_Oil":score,"USD_Index":score,"Crypto":score,"INR_USD":score,"VIX":score}},"analysis":"2-3 sentences with 2nd/3rd order effects, name Indian companies","analyst_brief":"5 numbered action items"}
+Each object must have these exact fields:
+- "id": sequential number starting from 1
+- "headline": the headline text
+- "source": source name
+- "type": one of "Monetary Policy", "Geopolitical", "Earnings", "Regulatory", "Commodity Shock", "Trade Policy", "Currency", "Tech Disruption"
+- "timestamp": "${new Date().toISOString()}"
+- "impacts": object with "markets" (US, India, China, EU, Japan, UK, EM, Middle_East), "sectors" (Banking, Technology, Pharma, Energy, Metals, Real_Estate, FMCG, Auto, Telecom, Infrastructure), "assets" (Equities, Bonds, Gold, Crude_Oil, USD_Index, Crypto, INR_USD, VIX) - all scores from -5 to +5
+- "analysis": 2-3 sentences covering 1st, 2nd, 3rd order effects. Name specific Indian companies (Reliance, TCS, HDFC Bank, SBI, etc.)
+- "analyst_brief": "1) Action item 2) Action item 3) Action item 4) Action item 5) Action item"
 
-Scores: -5 to +5. India lens: consider INR, FPI flows, RBI. Return ONLY valid JSON array.`;
+Important: Score with India-centric lens. Consider INR/USD, FPI flows, RBI policy implications.
+
+Respond with ONLY the JSON array. No explanation, no markdown.`;
 
   try {
     const res = await fetch(
@@ -156,17 +165,47 @@ Scores: -5 to +5. India lens: consider INR, FPI flows, RBI. Return ONLY valid JS
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { temperature: 0.3, maxOutputTokens: 8192, responseMimeType: 'application/json' }
+          generationConfig: { temperature: 0.3, maxOutputTokens: 8192 }
         })
       }
     );
+
+    if (!res.ok) {
+      const errText = await res.text();
+      return { analyzed: null, error: `Gemini HTTP ${res.status}: ${errText.substring(0, 200)}` };
+    }
+
     const data = await res.json();
+
+    // Check for API-level errors
+    if (data.error) {
+      return { analyzed: null, error: `Gemini API: ${data.error.message || JSON.stringify(data.error)}` };
+    }
+
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) return { analyzed: null, error: 'Empty Gemini response' };
-    let cleaned = text.trim().replace(/^```json?\n?/, '').replace(/\n?```$/, '');
-    return { analyzed: JSON.parse(cleaned), error: null };
+    if (!text) {
+      const blockReason = data?.candidates?.[0]?.finishReason || data?.promptFeedback?.blockReason || 'unknown';
+      return { analyzed: null, error: `Gemini empty response (reason: ${blockReason})` };
+    }
+
+    // Extract JSON from response (handle markdown wrapping)
+    let cleaned = text.trim();
+    // Remove markdown code blocks if present
+    cleaned = cleaned.replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/i, '');
+    // Find the JSON array
+    const arrayStart = cleaned.indexOf('[');
+    const arrayEnd = cleaned.lastIndexOf(']');
+    if (arrayStart !== -1 && arrayEnd !== -1) {
+      cleaned = cleaned.substring(arrayStart, arrayEnd + 1);
+    }
+
+    const parsed = JSON.parse(cleaned);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return { analyzed: parsed, error: null };
+    }
+    return { analyzed: null, error: 'Gemini returned non-array or empty array' };
   } catch (e) {
-    return { analyzed: null, error: `Gemini: ${e.message}` };
+    return { analyzed: null, error: `Gemini parse: ${e.message}` };
   }
 }
 
@@ -247,15 +286,22 @@ async function generateGeminiPredictions(analyzedNews) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          contents: [{ parts: [{ text: `Generate 15 Indian stock (NSE) predictions based on these news:\n${newsContext}\n\nReturn JSON array with: id, ticker, name, exchange:"NSE", sector, cmp (realistic INR price), recommendation ("STRONG BUY"|"BUY"|"HOLD"|"SELL"|"AVOID"), confidence (50-95), targetRange [low,high], stopLoss, timeframe, linkedHeadlines [ids], reasoning, catalysts [list], risks [list]. Mix: 4+ BUY, 2 HOLD, 4+ SELL/AVOID. Return ONLY JSON array.` }] }],
-          generationConfig: { temperature: 0.3, maxOutputTokens: 8192, responseMimeType: 'application/json' }
+          contents: [{ parts: [{ text: `Generate 15 Indian stock (NSE) predictions based on these news:\n${newsContext}\n\nReturn a JSON array where each object has: id, ticker, name, exchange:"NSE", sector, cmp (realistic current INR price), recommendation ("STRONG BUY"|"BUY"|"HOLD"|"SELL"|"AVOID"), confidence (50-95), targetRange [low,high], stopLoss, timeframe, linkedHeadlines [headline id numbers], reasoning (2-3 sentences), catalysts (array of strings), risks (array of strings). Include a mix: 4+ BUY, 2 HOLD, 4+ SELL/AVOID. Respond with ONLY the JSON array.` }] }],
+          generationConfig: { temperature: 0.3, maxOutputTokens: 8192 }
         })
       }
     );
+    if (!res.ok) return null;
     const data = await res.json();
+    if (data.error) return null;
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!text) return null;
-    return JSON.parse(text.trim().replace(/^```json?\n?/, '').replace(/\n?```$/, ''));
+    let cleaned = text.trim().replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/i, '');
+    const arrStart = cleaned.indexOf('[');
+    const arrEnd = cleaned.lastIndexOf(']');
+    if (arrStart !== -1 && arrEnd !== -1) cleaned = cleaned.substring(arrStart, arrEnd + 1);
+    const parsed = JSON.parse(cleaned);
+    return Array.isArray(parsed) && parsed.length > 0 ? parsed : null;
   } catch { return null; }
 }
 
