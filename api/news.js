@@ -1,24 +1,27 @@
 // /api/news.js — Vercel Serverless Function
-// Fetches news from NewsAPI + RSS feeds, analyzes with Gemini AI
-// Runs on cron (3x daily) or on-demand via GET /api/news
+// Fetches news from NewsAPI + RSS feeds
+// Analyzes with Gemini AI (if available) or rule-based fallback
 
 const NEWS_API_KEY = process.env.NEWS_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL = 'gemini-2.0-flash';
 
-// ===== RSS PARSER (lightweight, no dependencies) =====
+// ===== RSS PARSER =====
 function parseRSSItems(xml, maxItems = 10) {
   const items = [];
   const itemRegex = /<item>([\s\S]*?)<\/item>/gi;
   let match;
   while ((match = itemRegex.exec(xml)) !== null && items.length < maxItems) {
     const itemXml = match[1];
-    const title = (itemXml.match(/<title><!\[CDATA\[(.*?)\]\]>|<title>(.*?)<\/title>/) || [])[1] || (itemXml.match(/<title>(.*?)<\/title>/) || [])[1] || '';
-    const link = (itemXml.match(/<link>(.*?)<\/link>/) || [])[1] || '';
-    const pubDate = (itemXml.match(/<pubDate>(.*?)<\/pubDate>/) || [])[1] || '';
-    const desc = (itemXml.match(/<description><!\[CDATA\[(.*?)\]\]>|<description>(.*?)<\/description>/) || [])[1] || '';
-    if (title.trim()) {
-      items.push({ title: title.trim(), link, pubDate, description: desc.trim() });
+    const getText = (tag) => {
+      const cdataMatch = itemXml.match(new RegExp(`<${tag}><!\\[CDATA\\[([\\s\\S]*?)\\]\\]></${tag}>`));
+      if (cdataMatch) return cdataMatch[1].trim();
+      const plainMatch = itemXml.match(new RegExp(`<${tag}>(.*?)</${tag}>`));
+      return plainMatch ? plainMatch[1].trim() : '';
+    };
+    const title = getText('title');
+    if (title) {
+      items.push({ title, link: getText('link'), pubDate: getText('pubDate'), description: getText('description') });
     }
   }
   return items;
@@ -29,121 +32,121 @@ async function fetchAllNews() {
   const headlines = [];
   const errors = [];
 
-  // 1. NewsAPI — Business headlines
+  // 1. NewsAPI
   if (NEWS_API_KEY) {
     try {
       const res = await fetch(
         `https://newsapi.org/v2/top-headlines?category=business&language=en&pageSize=10&apiKey=${NEWS_API_KEY}`
       );
       const data = await res.json();
-      if (data.articles) {
+      if (data.status === 'error') {
+        errors.push(`NewsAPI: ${data.message}`);
+      } else if (data.articles) {
         data.articles.forEach(a => {
           if (a.title && !a.title.includes('[Removed]')) {
-            headlines.push({
-              headline: a.title,
-              source: a.source?.name || 'NewsAPI',
-              url: a.url,
-              publishedAt: a.publishedAt,
-              origin: 'newsapi'
-            });
+            headlines.push({ headline: a.title, source: a.source?.name || 'NewsAPI', url: a.url, publishedAt: a.publishedAt, origin: 'newsapi' });
           }
         });
       }
-    } catch (e) {
-      errors.push(`NewsAPI error: ${e.message}`);
-    }
+    } catch (e) { errors.push(`NewsAPI: ${e.message}`); }
+  } else {
+    errors.push('NEWS_API_KEY not set');
   }
 
-  // 2. Economic Times RSS — Indian market news
+  // 2. Economic Times RSS
   try {
     const res = await fetch('https://economictimes.indiatimes.com/rssfeedsdefault.cms', {
-      headers: { 'User-Agent': 'MarketIntel/1.0' }
+      headers: { 'User-Agent': 'MarketIntel/1.0' },
+      signal: AbortSignal.timeout(8000)
     });
     const xml = await res.text();
-    const items = parseRSSItems(xml, 8);
-    items.forEach(item => {
-      headlines.push({
-        headline: item.title,
-        source: 'Economic Times',
-        url: item.link,
-        publishedAt: item.pubDate,
-        origin: 'et_rss'
-      });
+    parseRSSItems(xml, 8).forEach(item => {
+      headlines.push({ headline: item.title, source: 'Economic Times', url: item.link, publishedAt: item.pubDate, origin: 'et_rss' });
     });
-  } catch (e) {
-    errors.push(`ET RSS error: ${e.message}`);
-  }
+  } catch (e) { errors.push(`ET RSS: ${e.message}`); }
 
   // 3. Moneycontrol RSS
   try {
     const res = await fetch('https://www.moneycontrol.com/rss/latestnews.xml', {
-      headers: { 'User-Agent': 'MarketIntel/1.0' }
+      headers: { 'User-Agent': 'MarketIntel/1.0' },
+      signal: AbortSignal.timeout(8000)
     });
     const xml = await res.text();
-    const items = parseRSSItems(xml, 5);
-    items.forEach(item => {
-      headlines.push({
-        headline: item.title,
-        source: 'Moneycontrol',
-        url: item.link,
-        publishedAt: item.pubDate,
-        origin: 'moneycontrol_rss'
-      });
+    parseRSSItems(xml, 5).forEach(item => {
+      headlines.push({ headline: item.title, source: 'Moneycontrol', url: item.link, publishedAt: item.pubDate, origin: 'moneycontrol_rss' });
     });
-  } catch (e) {
-    errors.push(`Moneycontrol RSS error: ${e.message}`);
-  }
+  } catch (e) { errors.push(`MC RSS: ${e.message}`); }
 
-  // Deduplicate by headline similarity
+  // Deduplicate
   const unique = [];
   const seen = new Set();
   for (const h of headlines) {
     const key = h.headline.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 40);
-    if (!seen.has(key)) {
-      seen.add(key);
-      unique.push(h);
-    }
+    if (!seen.has(key)) { seen.add(key); unique.push(h); }
   }
-
   return { headlines: unique.slice(0, 15), errors };
+}
+
+// ===== RULE-BASED SCORING (no AI needed) =====
+const KEYWORD_RULES = [
+  // Geopolitical / Commodity
+  { pattern: /oil|crude|brent|opec|hormuz|iran|iraq|saudi|gulf|energy crisis/i, type: 'Geopolitical | Commodity Shock', impacts: { markets: { US: -2, India: -4, China: -2, EU: -2, Japan: -2, UK: -1, EM: -3, Middle_East: -4 }, sectors: { Banking: -1, Technology: 0, Pharma: 0, Energy: 4, Metals: 1, Real_Estate: -1, FMCG: -2, Auto: -2, Telecom: 0, Infrastructure: -1 }, assets: { Equities: -2, Bonds: 2, Gold: 3, Crude_Oil: 4, USD_Index: 2, Crypto: -1, INR_USD: -3, VIX: 3 } } },
+  // Monetary Policy
+  { pattern: /fed|rate cut|rate hike|rbi|repo rate|monetary policy|interest rate|inflation|cpi|unemployment|jobs|labor|nonfarm/i, type: 'Monetary Policy', impacts: { markets: { US: -1, India: -1, China: 0, EU: 0, Japan: 0, UK: 0, EM: -1, Middle_East: 0 }, sectors: { Banking: -2, Technology: -1, Pharma: 0, Energy: 0, Metals: 0, Real_Estate: -2, FMCG: 0, Auto: -1, Telecom: 0, Infrastructure: -1 }, assets: { Equities: -1, Bonds: -2, Gold: 1, Crude_Oil: 0, USD_Index: 1, Crypto: 0, INR_USD: -1, VIX: 1 } } },
+  // Tech
+  { pattern: /ai|artificial intelligence|tech|nasdaq|magnificent|nvidia|google|apple|microsoft|meta|amazon|semiconductor|chip/i, type: 'Tech Disruption', impacts: { markets: { US: -2, India: -1, China: -1, EU: 0, Japan: 1, UK: 0, EM: 0, Middle_East: 0 }, sectors: { Banking: 0, Technology: -3, Pharma: 0, Energy: 0, Metals: 0, Real_Estate: 0, FMCG: 0, Auto: 0, Telecom: -1, Infrastructure: 0 }, assets: { Equities: -2, Bonds: 1, Gold: 0, Crude_Oil: 0, USD_Index: 0, Crypto: -1, INR_USD: 0, VIX: 2 } } },
+  // Earnings
+  { pattern: /earnings|revenue|profit|quarter|results|beats|misses|guidance|eps|revenue miss|q[1-4]/i, type: 'Earnings', impacts: { markets: { US: -1, India: 0, China: 0, EU: 0, Japan: 0, UK: 0, EM: 0, Middle_East: 0 }, sectors: { Banking: 0, Technology: -1, Pharma: 0, Energy: 0, Metals: 0, Real_Estate: 0, FMCG: 0, Auto: 0, Telecom: 0, Infrastructure: 0 }, assets: { Equities: -1, Bonds: 0, Gold: 0, Crude_Oil: 0, USD_Index: 0, Crypto: 0, INR_USD: 0, VIX: 1 } } },
+  // Regulatory / India
+  { pattern: /sebi|rbi|regulation|compliance|penalty|licence|ban|fintech|paytm|basel|npa|bank fraud/i, type: 'Regulatory', impacts: { markets: { US: 0, India: -2, China: 0, EU: 0, Japan: 0, UK: 0, EM: 0, Middle_East: 0 }, sectors: { Banking: -2, Technology: -1, Pharma: 0, Energy: 0, Metals: 0, Real_Estate: -1, FMCG: 0, Auto: 0, Telecom: 0, Infrastructure: 0 }, assets: { Equities: -1, Bonds: 0, Gold: 0, Crude_Oil: 0, USD_Index: 0, Crypto: 0, INR_USD: 0, VIX: 1 } } },
+  // Trade / Tariff
+  { pattern: /tariff|trade war|sanctions|export|import ban|china trade|us-china|wto/i, type: 'Trade Policy', impacts: { markets: { US: -2, India: -1, China: -3, EU: -1, Japan: -1, UK: 0, EM: -2, Middle_East: 0 }, sectors: { Banking: 0, Technology: -2, Pharma: -1, Energy: 0, Metals: -1, Real_Estate: 0, FMCG: -1, Auto: -2, Telecom: 0, Infrastructure: 0 }, assets: { Equities: -2, Bonds: 1, Gold: 2, Crude_Oil: 0, USD_Index: 1, Crypto: 0, INR_USD: -1, VIX: 2 } } },
+  // Currency
+  { pattern: /rupee|dollar|forex|currency|yen|euro|inr|fx reserve|devaluation/i, type: 'Currency', impacts: { markets: { US: 0, India: -2, China: -1, EU: 0, Japan: 0, UK: 0, EM: -1, Middle_East: 0 }, sectors: { Banking: -1, Technology: 1, Pharma: 1, Energy: -1, Metals: 0, Real_Estate: 0, FMCG: -1, Auto: -1, Telecom: 0, Infrastructure: 0 }, assets: { Equities: -1, Bonds: 0, Gold: 1, Crude_Oil: 0, USD_Index: 1, Crypto: 0, INR_USD: -2, VIX: 1 } } },
+  // Positive / Market rally
+  { pattern: /rally|surge|record high|bull|upgrade|boom|stimulus|growth|recovery/i, type: 'Earnings', impacts: { markets: { US: 2, India: 1, China: 1, EU: 1, Japan: 1, UK: 1, EM: 1, Middle_East: 0 }, sectors: { Banking: 1, Technology: 2, Pharma: 0, Energy: 0, Metals: 1, Real_Estate: 1, FMCG: 1, Auto: 1, Telecom: 0, Infrastructure: 1 }, assets: { Equities: 2, Bonds: -1, Gold: -1, Crude_Oil: 0, USD_Index: 0, Crypto: 1, INR_USD: 1, VIX: -2 } } },
+  // Gold
+  { pattern: /gold|silver|precious metal|safe haven|gold etf/i, type: 'Commodity Shock', impacts: { markets: { US: 0, India: 0, China: 0, EU: 0, Japan: 0, UK: 0, EM: 0, Middle_East: 0 }, sectors: { Banking: 0, Technology: 0, Pharma: 0, Energy: 0, Metals: 3, Real_Estate: 0, FMCG: 0, Auto: 0, Telecom: 0, Infrastructure: 0 }, assets: { Equities: 0, Bonds: 0, Gold: 3, Crude_Oil: 0, USD_Index: -1, Crypto: 0, INR_USD: 0, VIX: 0 } } },
+];
+
+const DEFAULT_IMPACTS = { markets: { US: 0, India: 0, China: 0, EU: 0, Japan: 0, UK: 0, EM: 0, Middle_East: 0 }, sectors: { Banking: 0, Technology: 0, Pharma: 0, Energy: 0, Metals: 0, Real_Estate: 0, FMCG: 0, Auto: 0, Telecom: 0, Infrastructure: 0 }, assets: { Equities: 0, Bonds: 0, Gold: 0, Crude_Oil: 0, USD_Index: 0, Crypto: 0, INR_USD: 0, VIX: 0 } };
+
+function analyzeWithRules(headlines) {
+  return headlines.map((h, i) => {
+    let matched = null;
+    for (const rule of KEYWORD_RULES) {
+      if (rule.pattern.test(h.headline)) { matched = rule; break; }
+    }
+    return {
+      id: i + 1,
+      headline: h.headline,
+      source: h.source,
+      type: matched ? matched.type : 'Earnings',
+      timestamp: h.publishedAt || new Date().toISOString(),
+      impacts: matched ? JSON.parse(JSON.stringify(matched.impacts)) : JSON.parse(JSON.stringify(DEFAULT_IMPACTS)),
+      analysis: `Headline from ${h.source}. ${matched ? `Classified as ${matched.type} based on keyword matching.` : 'No strong keyword signal detected.'} Further analysis requires Gemini AI integration — add GEMINI_API_KEY in Vercel environment variables for full 2nd/3rd order effect analysis.`,
+      analyst_brief: `1) Monitor this story for further developments. 2) Cross-reference with sector-specific data. 3) Check for follow-up coverage across Indian financial media. 4) Assess portfolio exposure to affected sectors. 5) Enable Gemini AI for detailed action items.`
+    };
+  });
 }
 
 // ===== GEMINI AI ANALYSIS =====
 async function analyzeWithGemini(headlines) {
-  if (!GEMINI_API_KEY) {
-    return { error: 'GEMINI_API_KEY not configured', analyzed: [] };
+  if (!GEMINI_API_KEY || GEMINI_API_KEY === 'placeholder') {
+    return { analyzed: null, error: 'GEMINI_API_KEY not configured' };
   }
 
   const headlineList = headlines.map((h, i) => `${i + 1}. "${h.headline}" — ${h.source}`).join('\n');
 
-  const prompt = `You are a Global Markets Intelligence Analyst at a top investment bank. Analyze these news headlines and return a JSON array. For EACH headline, return an object with:
+  const prompt = `You are a Global Markets Intelligence Analyst. Analyze these headlines and return a JSON array.
 
 HEADLINES:
 ${headlineList}
 
-For each headline, return this exact JSON structure:
-{
-  "id": (number, sequential),
-  "headline": "the headline text",
-  "source": "source name",
-  "type": "Monetary Policy | Geopolitical | Earnings | Regulatory | Commodity Shock | Trade Policy | Currency | Tech Disruption",
-  "timestamp": "ISO date string",
-  "impacts": {
-    "markets": { "US": score, "India": score, "China": score, "EU": score, "Japan": score, "UK": score, "EM": score, "Middle_East": score },
-    "sectors": { "Banking": score, "Technology": score, "Pharma": score, "Energy": score, "Metals": score, "Real_Estate": score, "FMCG": score, "Auto": score, "Telecom": score, "Infrastructure": score },
-    "assets": { "Equities": score, "Bonds": score, "Gold": score, "Crude_Oil": score, "USD_Index": score, "Crypto": score, "INR_USD": score, "VIX": score }
-  },
-  "analysis": "2-3 sentences covering first, second, and third-order effects. Name specific companies (Indian: RELIANCE, TCS, HDFC Bank, etc.)",
-  "analyst_brief": "5 numbered specific action items an analyst should do, like: 1) Issue BUY on XYZ 2) Downgrade ABC..."
-}
+For each, return:
+{"id":number,"headline":"text","source":"name","type":"Monetary Policy|Geopolitical|Earnings|Regulatory|Commodity Shock|Trade Policy|Currency|Tech Disruption","timestamp":"ISO date","impacts":{"markets":{"US":score,"India":score,"China":score,"EU":score,"Japan":score,"UK":score,"EM":score,"Middle_East":score},"sectors":{"Banking":score,"Technology":score,"Pharma":score,"Energy":score,"Metals":score,"Real_Estate":score,"FMCG":score,"Auto":score,"Telecom":score,"Infrastructure":score},"assets":{"Equities":score,"Bonds":score,"Gold":score,"Crude_Oil":score,"USD_Index":score,"Crypto":score,"INR_USD":score,"VIX":score}},"analysis":"2-3 sentences with 2nd/3rd order effects, name Indian companies","analyst_brief":"5 numbered action items"}
 
-SCORING RULES:
-- Scale: -5 (severe negative) to +5 (strong positive), 0 = no impact
-- India-specific lens: always consider INR, FPI flows, RBI policy
-- Name specific Indian companies in analysis (NSE tickers)
-- Be precise with scores — don't default to 0
-
-Return ONLY a valid JSON array, no markdown, no backticks, no explanation. Just the raw JSON array.`;
+Scores: -5 to +5. India lens: consider INR, FPI flows, RBI. Return ONLY valid JSON array.`;
 
   try {
     const res = await fetch(
@@ -153,80 +156,90 @@ Return ONLY a valid JSON array, no markdown, no backticks, no explanation. Just 
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: 0.3,
-            maxOutputTokens: 8192,
-            responseMimeType: 'application/json'
-          }
+          generationConfig: { temperature: 0.3, maxOutputTokens: 8192, responseMimeType: 'application/json' }
         })
       }
     );
-
     const data = await res.json();
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-
-    if (!text) {
-      return { error: 'Empty Gemini response', analyzed: [], raw: data };
-    }
-
-    // Parse JSON (handle potential markdown wrapping)
-    let cleaned = text.trim();
-    if (cleaned.startsWith('```')) {
-      cleaned = cleaned.replace(/^```json?\n?/, '').replace(/\n?```$/, '');
-    }
-
-    const analyzed = JSON.parse(cleaned);
-    return { analyzed, error: null };
-
+    if (!text) return { analyzed: null, error: 'Empty Gemini response' };
+    let cleaned = text.trim().replace(/^```json?\n?/, '').replace(/\n?```$/, '');
+    return { analyzed: JSON.parse(cleaned), error: null };
   } catch (e) {
-    return { error: `Gemini error: ${e.message}`, analyzed: [] };
+    return { analyzed: null, error: `Gemini: ${e.message}` };
   }
 }
 
-// ===== GENERATE STOCK PREDICTIONS =====
-async function generatePredictions(analyzedNews) {
-  if (!GEMINI_API_KEY || !analyzedNews.length) {
-    return { predictions: [], error: 'No API key or no analyzed news' };
-  }
+// ===== STOCK PREDICTIONS (rule-based fallback) =====
+function generateRulePredictions(analyzedNews) {
+  // Compute aggregate sector scores
+  const sectorScores = {};
+  analyzedNews.forEach(n => {
+    if (n.impacts?.sectors) {
+      Object.entries(n.impacts.sectors).forEach(([k, v]) => {
+        sectorScores[k] = (sectorScores[k] || 0) + v;
+      });
+    }
+  });
 
+  const STOCK_MAP = [
+    { ticker: 'ONGC', name: 'Oil & Natural Gas Corp', sector: 'Energy', cmp: 278, linkedSectors: ['Energy'] },
+    { ticker: 'RELIANCE', name: 'Reliance Industries', sector: 'Energy / Conglomerate', cmp: 1285, linkedSectors: ['Energy', 'Technology'] },
+    { ticker: 'TCS', name: 'Tata Consultancy Services', sector: 'IT Services', cmp: 3580, linkedSectors: ['Technology'] },
+    { ticker: 'HDFCBANK', name: 'HDFC Bank', sector: 'Banking', cmp: 1620, linkedSectors: ['Banking'] },
+    { ticker: 'ITC', name: 'ITC Limited', sector: 'FMCG', cmp: 435, linkedSectors: ['FMCG'] },
+    { ticker: 'SBIN', name: 'State Bank of India', sector: 'Banking', cmp: 785, linkedSectors: ['Banking'] },
+    { ticker: 'IOC', name: 'Indian Oil Corporation', sector: 'Energy (Downstream)', cmp: 128, linkedSectors: ['Energy'] },
+    { ticker: 'BPCL', name: 'Bharat Petroleum', sector: 'Energy (Downstream)', cmp: 295, linkedSectors: ['Energy'] },
+    { ticker: 'MARUTI', name: 'Maruti Suzuki India', sector: 'Auto', cmp: 12400, linkedSectors: ['Auto'] },
+    { ticker: 'DLF', name: 'DLF Limited', sector: 'Real Estate', cmp: 720, linkedSectors: ['Real_Estate'] },
+    { ticker: 'TITAN', name: 'Titan Company', sector: 'Consumer', cmp: 3250, linkedSectors: ['FMCG', 'Metals'] },
+    { ticker: 'COALINDIA', name: 'Coal India Ltd', sector: 'Mining', cmp: 395, linkedSectors: ['Energy', 'Metals'] },
+    { ticker: 'GOLDBEES', name: 'Nippon India Gold ETF', sector: 'Gold / Commodity', cmp: 62, linkedSectors: ['Metals'] },
+    { ticker: 'INFY', name: 'Infosys Limited', sector: 'IT Services', cmp: 1480, linkedSectors: ['Technology'] },
+    { ticker: 'ASIANPAINT', name: 'Asian Paints Ltd', sector: 'Consumer', cmp: 2680, linkedSectors: ['FMCG', 'Real_Estate'] },
+  ];
+
+  return STOCK_MAP.map((stock, i) => {
+    const avgScore = stock.linkedSectors.reduce((sum, s) => sum + (sectorScores[s] || 0), 0) / stock.linkedSectors.length;
+    const isOMC = ['IOC', 'BPCL'].includes(stock.ticker);
+    const effectiveScore = isOMC ? -Math.abs(avgScore) : avgScore; // OMCs hurt by high oil
+
+    let rec, conf, targetPct;
+    if (effectiveScore >= 3) { rec = 'STRONG BUY'; conf = 85; targetPct = 0.12; }
+    else if (effectiveScore >= 1) { rec = 'BUY'; conf = 75; targetPct = 0.08; }
+    else if (effectiveScore >= -1) { rec = 'HOLD'; conf = 60; targetPct = 0.02; }
+    else if (effectiveScore >= -3) { rec = 'AVOID'; conf = 70; targetPct = -0.08; }
+    else { rec = 'SELL'; conf = 80; targetPct = -0.12; }
+
+    const t1 = Math.round(stock.cmp * (1 + targetPct * 0.8));
+    const t2 = Math.round(stock.cmp * (1 + targetPct * 1.2));
+    const sl = Math.round(stock.cmp * (1 + (rec.includes('BUY') ? -0.08 : 0.08)));
+
+    return {
+      id: i + 1, ticker: stock.ticker, name: stock.name, exchange: 'NSE',
+      sector: stock.sector, cmp: stock.cmp, recommendation: rec, confidence: conf,
+      targetRange: [Math.min(t1, t2), Math.max(t1, t2)],
+      stopLoss: sl,
+      timeframe: rec === 'SELL' ? 'Immediate' : rec === 'STRONG BUY' ? '2-4 weeks' : '4-8 weeks',
+      linkedHeadlines: analyzedNews.filter(n =>
+        stock.linkedSectors.some(s => Math.abs(n.impacts?.sectors?.[s] || 0) >= 1)
+      ).map(n => n.id).slice(0, 3),
+      reasoning: `Based on aggregate sector analysis: ${stock.linkedSectors.map(s => `${s} (${sectorScores[s] || 0})`).join(', ')}. ${rec.includes('BUY') ? 'Positive sector tailwinds support upside.' : rec === 'HOLD' ? 'Mixed signals warrant caution.' : 'Negative sector headwinds create downside risk.'}`,
+      catalysts: rec.includes('BUY') ? ['Sector momentum', 'Favorable macro shift'] : ['Sector recovery', 'Policy intervention'],
+      risks: rec.includes('BUY') ? ['Global risk-off event', 'Earnings miss'] : ['Continued sector weakness', 'INR depreciation']
+    };
+  });
+}
+
+async function generateGeminiPredictions(analyzedNews) {
+  if (!GEMINI_API_KEY || GEMINI_API_KEY === 'placeholder' || !analyzedNews.length) {
+    return null;
+  }
   const newsContext = analyzedNews.map(n =>
-    `- "${n.headline}" (${n.type}) — India impact: ${n.impacts?.markets?.India || 0}, Key sectors: ${
-      Object.entries(n.impacts?.sectors || {}).filter(([,v]) => v !== 0).map(([k,v]) => `${k}:${v}`).join(', ')
-    }`
+    `- "${n.headline}" (${n.type}) — India: ${n.impacts?.markets?.India || 0}`
   ).join('\n');
 
-  const prompt = `Based on these analyzed market-moving news stories, generate Indian stock purchase/sell predictions.
-
-NEWS CONTEXT:
-${newsContext}
-
-Generate 12-17 specific Indian stock predictions (NSE-listed). Return a JSON array where each object has:
-{
-  "id": number,
-  "ticker": "NSE ticker symbol (e.g., ONGC, RELIANCE, TCS)",
-  "name": "Full company name",
-  "exchange": "NSE",
-  "sector": "sector name",
-  "recommendation": "STRONG BUY | BUY | HOLD | SELL | AVOID",
-  "confidence": number (50-95),
-  "targetRange": [low_target, high_target] (realistic INR prices),
-  "stopLoss": number (INR),
-  "timeframe": "Immediate | 2-4 weeks | 4-6 weeks | 4-8 weeks | Monitor",
-  "linkedHeadlines": [array of headline id numbers that drive this prediction],
-  "reasoning": "2-3 sentences explaining why, referencing the specific news impact",
-  "catalysts": ["catalyst 1", "catalyst 2"],
-  "risks": ["risk 1", "risk 2"]
-}
-
-RULES:
-- Include a mix: at least 4 BUY, 2 HOLD, 4 SELL/AVOID
-- Use realistic CMP (Current Market Price) values for Indian stocks
-- Link each prediction to specific headline IDs
-- Include upstream energy, IT exporters, OMCs, banks, FMCG, auto, fintech, real estate
-- Consider: INR/USD impact, RBI policy, FPI flows, oil prices, global risk appetite
-
-Return ONLY a valid JSON array, no markdown, no backticks.`;
-
   try {
     const res = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_API_KEY}`,
@@ -234,75 +247,79 @@ Return ONLY a valid JSON array, no markdown, no backticks.`;
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: 0.3,
-            maxOutputTokens: 8192,
-            responseMimeType: 'application/json'
-          }
+          contents: [{ parts: [{ text: `Generate 15 Indian stock (NSE) predictions based on these news:\n${newsContext}\n\nReturn JSON array with: id, ticker, name, exchange:"NSE", sector, cmp (realistic INR price), recommendation ("STRONG BUY"|"BUY"|"HOLD"|"SELL"|"AVOID"), confidence (50-95), targetRange [low,high], stopLoss, timeframe, linkedHeadlines [ids], reasoning, catalysts [list], risks [list]. Mix: 4+ BUY, 2 HOLD, 4+ SELL/AVOID. Return ONLY JSON array.` }] }],
+          generationConfig: { temperature: 0.3, maxOutputTokens: 8192, responseMimeType: 'application/json' }
         })
       }
     );
-
     const data = await res.json();
     const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) return null;
+    return JSON.parse(text.trim().replace(/^```json?\n?/, '').replace(/\n?```$/, ''));
+  } catch { return null; }
+}
 
-    if (!text) {
-      return { predictions: [], error: 'Empty Gemini response' };
-    }
-
-    let cleaned = text.trim();
-    if (cleaned.startsWith('```')) {
-      cleaned = cleaned.replace(/^```json?\n?/, '').replace(/\n?```$/, '');
-    }
-
-    const predictions = JSON.parse(cleaned);
-    return { predictions, error: null };
-
-  } catch (e) {
-    return { predictions: [], error: `Gemini predictions error: ${e.message}` };
-  }
+// ===== SENTIMENT =====
+function computeSentiment(stories) {
+  if (!stories.length) return { score: 0, average: '0', label: 'NEUTRAL', severity: 'mixed' };
+  let totalScore = 0, totalCells = 0;
+  stories.forEach(s => {
+    if (s.impacts) Object.values(s.impacts).forEach(cat => Object.values(cat).forEach(v => { totalScore += v; totalCells++; }));
+  });
+  return {
+    score: totalScore,
+    average: totalCells > 0 ? (totalScore / totalCells).toFixed(2) : '0',
+    label: totalScore < -10 ? 'RISK-OFF' : totalScore > 10 ? 'RISK-ON' : 'NEUTRAL',
+    severity: totalScore < -30 ? 'severe' : totalScore < -10 ? 'moderate' : totalScore > 10 ? 'bullish' : 'mixed'
+  };
 }
 
 // ===== MAIN HANDLER =====
 export default async function handler(req, res) {
-  // CORS headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
   res.setHeader('Cache-Control', 's-maxage=21600, stale-while-revalidate=3600');
 
   try {
-    console.log('[MarketIntel] Starting news fetch...');
-
-    // Step 1: Fetch all headlines
+    // Step 1: Fetch headlines
     const { headlines, errors: fetchErrors } = await fetchAllNews();
-    console.log(`[MarketIntel] Fetched ${headlines.length} headlines, ${fetchErrors.length} errors`);
 
     if (headlines.length === 0) {
       return res.status(200).json({
-        success: false,
-        error: 'No headlines fetched',
-        fetchErrors,
-        timestamp: new Date().toISOString(),
-        news: [],
-        predictions: []
+        success: false, error: 'No headlines fetched',
+        fetchErrors, timestamp: new Date().toISOString(),
+        news: [], predictions: [], sentiment: computeSentiment([]),
+        analysisMode: 'none'
       });
     }
 
-    // Step 2: Analyze with Gemini
-    const { analyzed, error: analysisError } = await analyzeWithGemini(headlines);
-    console.log(`[MarketIntel] Analyzed ${analyzed.length} headlines${analysisError ? `, error: ${analysisError}` : ''}`);
+    // Step 2: Try Gemini, fall back to rules
+    let analyzed;
+    let analysisMode = 'rules';
+    const { analyzed: geminiResult, error: geminiError } = await analyzeWithGemini(headlines);
 
-    // Step 3: Generate stock predictions
-    const { predictions, error: predError } = await generatePredictions(analyzed);
-    console.log(`[MarketIntel] Generated ${predictions.length} predictions${predError ? `, error: ${predError}` : ''}`);
+    if (geminiResult && geminiResult.length > 0) {
+      analyzed = geminiResult;
+      analysisMode = 'gemini';
+    } else {
+      analyzed = analyzeWithRules(headlines);
+      if (geminiError) fetchErrors.push(geminiError);
+    }
 
-    // Step 4: Compute aggregate data
-    const sentiment = computeSentiment(analyzed);
+    // Step 3: Generate predictions
+    let predictions;
+    if (analysisMode === 'gemini') {
+      const geminiPreds = await generateGeminiPredictions(analyzed);
+      predictions = geminiPreds || generateRulePredictions(analyzed);
+    } else {
+      predictions = generateRulePredictions(analyzed);
+    }
 
+    // Step 4: Return
     return res.status(200).json({
       success: true,
       timestamp: new Date().toISOString(),
+      analysisMode,
       sources: {
         newsapi: headlines.filter(h => h.origin === 'newsapi').length,
         et_rss: headlines.filter(h => h.origin === 'et_rss').length,
@@ -310,42 +327,14 @@ export default async function handler(req, res) {
       },
       news: analyzed,
       predictions,
-      sentiment,
-      errors: [...fetchErrors, analysisError, predError].filter(Boolean)
+      sentiment: computeSentiment(analyzed),
+      errors: fetchErrors.filter(Boolean)
     });
 
   } catch (e) {
-    console.error('[MarketIntel] Fatal error:', e);
     return res.status(500).json({
-      success: false,
-      error: e.message,
-      timestamp: new Date().toISOString(),
-      news: [],
-      predictions: []
+      success: false, error: e.message, timestamp: new Date().toISOString(),
+      news: [], predictions: [], sentiment: computeSentiment([])
     });
   }
-}
-
-function computeSentiment(stories) {
-  if (!stories.length) return { score: 0, average: '0', label: 'NEUTRAL', severity: 'mixed' };
-
-  let totalScore = 0;
-  let totalCells = 0;
-  stories.forEach(story => {
-    if (story.impacts) {
-      Object.values(story.impacts).forEach(category => {
-        Object.values(category).forEach(score => {
-          totalScore += score;
-          totalCells++;
-        });
-      });
-    }
-  });
-
-  return {
-    score: totalScore,
-    average: totalCells > 0 ? (totalScore / totalCells).toFixed(2) : '0',
-    label: totalScore < -10 ? 'RISK-OFF' : totalScore > 10 ? 'RISK-ON' : 'NEUTRAL',
-    severity: totalScore < -30 ? 'severe' : totalScore < -10 ? 'moderate' : totalScore > 10 ? 'bullish' : 'mixed'
-  };
 }
