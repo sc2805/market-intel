@@ -14,12 +14,16 @@ function parseRSSItems(xml, maxItems = 10) {
   while ((match = itemRegex.exec(xml)) !== null && items.length < maxItems) {
     const itemXml = match[1];
     const getText = (tag) => {
-      const cdataMatch = itemXml.match(new RegExp(`<${tag}><!\\[CDATA\\[([\\s\\S]*?)\\]\\]></${tag}>`));
+      // Try CDATA first
+      const cdataMatch = itemXml.match(new RegExp(`<${tag}>\\s*<!\\[CDATA\\[([\\s\\S]*?)\\]\\]>\\s*</${tag}>`, 'i'));
       if (cdataMatch) return cdataMatch[1].trim();
-      const plainMatch = itemXml.match(new RegExp(`<${tag}>(.*?)</${tag}>`));
+      // Plain text
+      const plainMatch = itemXml.match(new RegExp(`<${tag}>(.*?)</${tag}>`, 'i'));
       return plainMatch ? plainMatch[1].trim() : '';
     };
-    const title = getText('title');
+    let title = getText('title');
+    // Clean any remaining CDATA artifacts
+    title = title.replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').replace(/&amp;/g, '&').trim();
     if (title) {
       items.push({ title, link: getText('link'), pubDate: getText('pubDate'), description: getText('description') });
     }
